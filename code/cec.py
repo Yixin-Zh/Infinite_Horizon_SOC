@@ -37,12 +37,12 @@ class CEC:
         j = 0
         constrains = []
         # initial state constraint
-        error = ca.MX(state-init_ref_state)
+        error = ca.MX(self.compute_error(state, init_ref_state))
         for t in range(self.T-1):
             ref_state = self.ref_traj(iter)
             next_ref_state = self.ref_traj(iter + 1)
             # cost function
-            j += self.cost_function(error, U[:, t])
+            j += (gamma**t)*self.cost_function(error, U[:, t])
             # obstacle constraints
             obstacles_constraint = self.obstacles_constraint(error+ref_state)
             for c in obstacles_constraint:
@@ -94,7 +94,8 @@ class CEC:
         next_error_state = error_state\
                            + ca.mtimes(G, control) * time_step\
                            + (ca.MX(ref_state) - ca.MX(next_ref_state))
-
+        #
+        next_error_state[2] = ca.fmod(next_error_state[2] + ca.pi, 2 * ca.pi) - ca.pi
         return next_error_state
     def obstacles_constraint(self, state,):
         """
@@ -127,6 +128,14 @@ class CEC:
                 + q * (1-error_ori)**2
                 + ca.mtimes(ca.mtimes(control.T, R), control))
         return cost
+
+    def compute_error(self, state, ref_state):
+        """
+        Given the state and reference state, return the error state.
+        """
+        error = state - ref_state
+        error[2] = np.fmod(error[2] + np.pi, 2 * np.pi) - np.pi
+        return error
 
 if __name__ == "__main__":
     cec = CEC()

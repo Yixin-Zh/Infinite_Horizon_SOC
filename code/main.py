@@ -21,6 +21,7 @@ def main():
     cur_iter = 0
     controller = CEC()
     # Main loop
+    control_list = []
     while cur_iter * utils.time_step < utils.sim_time:
         t1 = time()
         # Get reference state
@@ -34,6 +35,7 @@ def main():
         # Generate control input
         # TODO: Replace this simple controller with your own controller
         control = controller(cur_iter, cur_state, cur_ref)
+        control_list.append(control)
         print("[v,w]", control)
         ################################################################
 
@@ -66,7 +68,7 @@ def main():
     car_states = np.array(car_states)
     times = np.array(times)
     utils.visualize(car_states, ref_traj, obstacles, times, utils.time_step, save=True)
-
+    print(control_list)
 
 if __name__ == "__main__":
     main()

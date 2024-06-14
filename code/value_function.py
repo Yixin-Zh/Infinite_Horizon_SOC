@@ -57,7 +57,7 @@ class GridValueFunction(ValueFunction):
     Grid-based value function
     """
     # TODO: your implementation
-    raise NotImplementedError
+    pass
 
 
 class FeatureValueFunction(ValueFunction):
@@ -65,6 +65,6 @@ class FeatureValueFunction(ValueFunction):
     Feature-based value function
     """
     # TODO: your implementation
-    raise NotImplementedError
+    pass
 
 
