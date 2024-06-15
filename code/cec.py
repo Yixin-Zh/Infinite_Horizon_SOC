@@ -10,7 +10,7 @@ size = 3
 
 # hyperparameters for value function
 Q = ca.diag([5, 5 ])  # position cost
-q = 0.02  # orientation cost
+q = 0.005  # orientation cost
 R = ca.diag([0.008, 0.008])  # control cost
 
 gamma = 0.85  # discount factor
@@ -125,7 +125,7 @@ class CEC:
         error_pos = error_state[:2]
         error_ori = ca.fmod(error_state[2] + ca.pi, 2 * ca.pi) - ca.pi
         cost = (ca.mtimes(ca.mtimes(error_pos.T, Q), error_pos)
-                + q * (1-error_ori)**2
+                + q * (1-ca.cos(error_ori))**2
                 + ca.mtimes(ca.mtimes(control.T, R), control))
         return cost
 

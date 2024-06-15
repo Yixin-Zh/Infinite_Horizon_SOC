@@ -4,33 +4,79 @@ from value_function import ValueFunction
 import utils
 import os
 from scipy.stats import multivariate_normal
+from scipy.linalg import inv, det, cholesky
+from joblib import Parallel, delayed
+import time
 # environment parameters
 traj = utils.lissajous
 obstacles = np.array([[-2, -2, 0.5], [1, 2, 0.5]])
-ex_space = np.linspace(-2, 2, 21)
-ey_space = np.linspace(-2, 2, 21)
-eth_space = np.linspace(-np.pi, np.pi, 40)
-v_space = np.linspace(0,1, 6)
+fine_grid = np.linspace(-0.25, 0.25, 7)
+
+# Medium grid for [-0.5, 0.5] divided into 5 parts excluding the overlap with fine grid
+medium_grid = np.concatenate([
+    np.linspace(-0.65, -0.25, 5),
+    np.linspace(0.25, 0.65, 5)
+])
+
+# Coarse grid for [-3, 3] divided into 5 parts excluding the overlap with medium and fine grid
+coarse_grid = np.concatenate([
+    np.linspace(-1.5, -0.65, 6),
+    np.linspace(0.65, 1.5, 6)
+])
+
+# Combine all grids
+ex_space = np.sort(np.unique(np.concatenate([fine_grid, medium_grid, coarse_grid])))
+ey_space = ex_space
+eth_space = np.linspace(-np.pi, np.pi, 33)
+v_space = np.linspace(0,1, 11)
 w_space = np.linspace(-1, 1, 11)
+
 # cost function parameters
 Q = np.diag([5, 5])
 q = 0.02
-R = np.diag([0.008, 0.008])
+R = np.diag([.01, .01])
 gamma = 0.9
 # GPI parameters
 num_evals = 10
-collision_margin = 0.1 # ?
+collision_margin = 0.05
 output_dir = "output"
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
-v_ex_space = np.linspace(-2, 2, 21) #
-v_ey_space = np.linspace(-2, 2, 21) # ?
+v_ex_space = np.linspace(-2, 1, 21) #
+v_ey_space = np.linspace(-1, 1, 21) # ?
 v_eth_space = np.linspace(-np.pi, np.pi, 40) # ?
 v_alpha = 0.1
 v_beta_t = 0.1
 v_beta_e = 0.1
 v_lr = 0.01
 v_batch_size = 10
+
+def process_time_step(t, all_pts, all_controls, T, traj, error_motion_model, get_top_pts):
+    transition_matrix_t = np.zeros((all_pts.shape[0], all_controls.shape[0], 8, 2), dtype=np.float16)
+    traj_t = traj(t)  # Assuming traj function is defined elsewhere
+    traj_t_prime = traj(t + 1)
+    t1 = time.time()
+
+    for i, pt in enumerate(all_pts):
+        next_error = error_motion_model(pt, traj_t, traj_t_prime, all_controls)
+        top_pts = get_top_pts(next_error)
+        transition_matrix_t[i] = top_pts
+
+    print(f"Time for t={t}: {time.time() - t1} seconds")
+    return transition_matrix_t
+
+def compute_costs_for_time_step(t, all_pts, all_controls, traj, cost_function):
+    """
+    Computes the costs for all states and controls at a given time step.
+    """
+    ref_state = traj(t)
+    costs = np.zeros((all_pts.shape[0], all_controls.shape[0]), dtype=np.float16)
+    t1 = time.time()
+    for i, pt in enumerate(all_pts):
+        error = pt - ref_state
+        costs[i] = cost_function(error, ref_state,all_controls)
+    print(f"Time for t={t}: {time.time() - t1} seconds")
+    return costs
 
 @dataclass
 class GpiConfig:
@@ -59,15 +105,24 @@ class GpiConfig:
     v_lr: float
     v_batch_size: int  # batch size if GPU memory is not enough
 
-
+config = GpiConfig(traj, obstacles, ex_space, ey_space, eth_space, v_space, w_space,
+                          Q, q, R, gamma, num_evals, collision_margin,
+                          ValueFunction, output_dir, v_ex_space, v_ey_space, v_eth_space, v_alpha, v_beta_t, v_beta_e, v_lr, v_batch_size)
 class GPI:
     def __init__(self, config: GpiConfig):
         self.config = config
+        # precompute all possible states and controls
         self.all_pts = self.get_all_pts()
         self.all_controls = self.get_all_controls()
-        self.noise = np.diag([utils.sigma[0], utils.sigma[0], utils.sigma[2]])
-        self.T = 100 # period of the reference trajectory
-        # TODO: other initialization code
+        # pdf parameters
+        self.D = 3
+        self.sigma = np.diag(utils.sigma)  # standard deviation of the error
+        self.cov = self.sigma ** 2  # covariance matrix
+        self.cov_inv = np.linalg.inv(self.cov) # inverse of the covariance matrix
+        self.const = 1.0 / np.sqrt((2 * np.pi) ** self.D * np.linalg.det(self.cov)) # constant term in the PDF formula
+        # period of the reference trajectory
+        self.T = 100
+        self.policy = np.load(os.path.join(self.config.output_dir, "optimal_policy.npy"))
 
     def __call__(self, t: int, cur_state: np.ndarray, cur_ref_state: np.ndarray) -> np.ndarray:
         """
@@ -79,171 +134,174 @@ class GPI:
         Returns:
             np.ndarray: control input
         """
-        # TODO: your implementation
-        raise NotImplementedError
+        error = cur_state - cur_ref_state
+        error[2] = np.fmod(error[2] + np.pi, 2 * np.pi) - np.pi  # Normalize angle error
 
-    def state_metric_to_index(self, metric_state: np.ndarray) :
-        """
-        Convert the metric state to grid indices according to your descretization design.
-        Args:
-            metric_state (np.ndarray): metric state [3,N]
-        Returns:
-            array of indices: ex [N,], ey [N,], eth [N,]
-        """
-        ex = np.digitize(metric_state[0], self.config.ex_space, right=True)
-        ey = np.digitize(metric_state[1], self.config.ey_space, right=True)
-        eth = np.digitize(metric_state[2], self.config.eth_space, right=True)
-        return ex, ey, eth
+        # Using searchsorted to find the closest indices for each state dimension
+        ex_index = np.searchsorted(self.config.ex_space, error[0], side='left') - 1
+        ey_index = np.searchsorted(self.config.ey_space, error[1], side='left') - 1
+        eth_index = np.searchsorted(self.config.eth_space, error[2], side='left') - 1
 
-    def state_index_to_metric(self, state_index):
-        """
-        Convert the grid indices to metric state according to your descretization design.
-        Args:
-            state_index (tuple): (ex, ey, eth)
-        Returns:
-            np.ndarray: metric state
-        """
-        ex = self.config.ex_space[state_index[0]]
-        ey = self.config.ey_space[state_index[1]]
-        eth = self.config.eth_space[state_index[2]]
-        return ex, ey, eth
+        # Ensure the indices are within the valid range
+        ex_index = np.clip(ex_index, 0, len(self.config.ex_space) - 1)
+        ey_index = np.clip(ey_index, 0, len(self.config.ey_space) - 1)
+        eth_index = np.clip(eth_index, 0, len(self.config.eth_space) - 1)
 
-    def control_metric_to_index(self, control_metric: np.ndarray):
-        """
-        Args:
-            control_metric: [2, N] array of controls in metric space
-        Returns:
-            [N, ] array of indices in the control space
-        """
-        v: np.ndarray = np.digitize(control_metric[0], self.config.v_space, right=True)
-        w: np.ndarray = np.digitize(control_metric[1], self.config.w_space, right=True)
-        return v, w
+        # Handle angle wrapping by using modulo operation for the angular dimension index
+        eth_index = np.mod(eth_index, len(self.config.eth_space))
 
-    def control_index_to_metric(self, v: np.ndarray, w: np.ndarray):
-        """
-        Args:
-            v: [N, ] array of indices in the v space
-            w: [N, ] array of indices in the w space
-        Returns:
-            [2, N] array of controls in metric space
-        """
-        return self.config.v_space[v], self.config.w_space[w]
+        # Assuming the state space is a flat array of combined indices, calculate a single index
+        cur_index = ex_index * len(self.config.ey_space) * len(self.config.eth_space) + \
+                    ey_index * len(self.config.eth_space) + eth_index
+
+        points = self.all_pts[cur_index]
+        print("#"*10)
+        print(np.linalg.norm(points - error))   # debug
+        # Modulate t to [0, T)
+        t = t % self.T
+
+        # Get the control index from the policy matrix
+        control_index = self.policy[t, cur_index]
+        return self.all_controls[control_index]
 
     def compute_transition_matrix(self):
-        """
-        Compute the transition matrix in advance to speed up the GPI algorithm.
-        Returns:
-            shape: [t, number of points, n_v, n_w, 8, 2]
-            Explanation:
-                [t, number of points] is the current state
-                [n_v, n_w] is the control
-                [8, 2] is top 8 points index and probability
-        Note: points index refers to the index in self.all_pts
-        """
-        transition_matrix = np.zeros((self.T, self.all_controls.shape[0], self.all_pts.shape[0], 8, 2))
-
-        for t in range(self.T):
-            traj_t = traj(t)
-            traj_t_prime = traj(t + 1)
-            # make shape [3,] to [N, 3]
-            traj_t = np.tile(traj_t, (self.all_pts.shape[0], 1))
-            traj_t_prime = np.tile(traj_t_prime, (self.all_pts.shape[0], 1))
-            for i, control in enumerate(self.all_controls):
-                for j, point in enumerate(self.all_pts):
-                    error = point - traj_t
-                    next_error = self.error_motion_model(error, traj_t, traj_t_prime, control)
-                    top_info = self.get_top_pts(next_error)
-                    transition_matrix[t, i, j] = top_info
+        results = Parallel(n_jobs=-1)(
+            delayed(process_time_step)(t, self.all_pts, self.all_controls, self.T, traj, self.error_motion_model,
+                                       self.get_top_pts)
+            for t in range(self.T))
+        transition_matrix = np.array(results, dtype=np.float16)
+        # save the transition matrix
+        np.save(os.path.join(self.config.output_dir, "transition_matrix.npy"), transition_matrix)
         return transition_matrix
-
     def compute_stage_costs(self):
         """
         Compute the stage costs in advance to speed up the GPI algorithm.
+        Uses parallel computation to improve performance.
         """
-        # TODO: your implementation
-        raise NotImplementedError
-
-    def init_value_function(self):
+        # Parallel computation across time steps
+        results = Parallel(n_jobs=-1)(delayed(compute_costs_for_time_step)(
+            t, self.all_pts, self.all_controls, self.config.traj, self.cost_function)
+                                      for t in range(self.T))
+        stage_costs = np.array(results, dtype=np.float16)
+        # save the stage costs
+        np.save(os.path.join(self.config.output_dir, "stage_costs.npy"), stage_costs)
+    def cost_function(self, error, ref_state, control):
         """
-        Initialize the value function.
-        """
-        # TODO: your implementation
-        raise NotImplementedError
-
-    def evaluate_value_function(self):
-        """
-        Evaluate the value function. Implement this function if you are using a feature-based value function.
-        """
-        # TODO: your implementation
-        raise NotImplementedError
-
-    @utils.timer
-    def policy_improvement(self):
-        """
-        Policy improvement step of the GPI algorithm.
-        """
-        # TODO: your implementation
-        raise NotImplementedError
-
-    @utils.timer
-    def policy_evaluation(self):
-        """
-        Policy evaluation step of the GPI algorithm.
-        """
-        # TODO: your implementation
-        raise NotImplementedError
-
-    def compute_policy(self, num_iters: int) -> None:
-        """
-        Compute the policy for a given number of iterations.
+        Compute the cost function.
         Args:
-            num_iters (int): number of iterations
+            error: [3,]
+            control: [N, 2]
+        Returns:
+            cost: float
         """
-        # TODO: your implementation
-        raise NotImplementedError
+        error_pos = error[:2]
+        error_ori = np.fmod(error[2] + np.pi, 2 * np.pi) - np.pi
+        cost1 = error_pos @ self.config.Q @ error_pos\
+                + self.config.q * (1 - np.cos(error_ori)) ** 2 # shape: [1,]
+        state = error + ref_state
+        # make sure not in obstacle
+        obstacle1 = self.config.obstacles[0]
+        obstacle2 = self.config.obstacles[1]
+        if np.linalg.norm(state[:2] - obstacle1[:2]) < obstacle1[2] + self.config.collision_margin\
+            or np.linalg.norm(state[:2] - obstacle2[:2]) < obstacle2[2] + self.config.collision_margin:
+            cost1 += 0
+        # # ensure not out of boundary
+        # if np.abs(state[0]) > 3 or np.abs(state[1]) > 3:
+        #     cost1 += 10
+        cost1 = np.tile(cost1, (control.shape[0],))
+        cost2 = np.einsum('ij,jk,ik->i', control, self.config.R, control)
+
+        # sum the costs
+        cost = cost1 + cost2
+        return cost
 
     def error_motion_model(self, error, ref_state, next_ref_state, control):
         """
         deterministic error motion model
         Args:
-            all inputs are in continuous space
-            error: error at time t
-            ref_state: reference state at time t
-            next_ref_state: reference state at time t+1
-            control: control input at time t
+            error: [3,]
+            ref_state: [3,]
+            next_ref_state: [3,]
+            control: [N, 2]
         Returns:
-            error at time t+1 [3,]
+            error at time t+1 [N, 3]
         """
-        G = np.array([[np.cos(ref_state[2]+error[2]), 0],
-                      [np.sin(ref_state[2]+error[2]), 0],
-                      [0, 1]])
-        ref_state = np.array(ref_state)
-        next_ref_state = np.array(next_ref_state)
-        next_error = error + G @ control * utils.time_step + (ref_state - next_ref_state)
+        # 1. modulate the angle to [-pi, pi]
+        N = control.shape[0]
+        error[2] = np.fmod(error[2] + np.pi, 2 * np.pi) - np.pi
+        # 2. compute G matrix shape
+        G = np.zeros((3, 2))
+        G[0, 0] = np.cos(error[2] + ref_state[2])
+        G[1, 0] = np.sin(error[2] + ref_state[2])
+        G[2, 1] = 1
+        # 3. ref_state - next_ref_state
+        ref_state = np.tile(ref_state, (N, 1))
+        next_ref_state = np.tile(next_ref_state, (N, 1))
+        ref_change = ref_state - next_ref_state
+        # make error to [N, 3]
+        error = np.tile(error, (N, 1))
+        # 4. compute the next error
+        next_error = error + (G @ control.T * utils.time_step).T + (ref_change)
+        # 5. modulate the angle to [-pi, pi]
+        # next_error shape: [N, 3]
+        next_error[:, 2] = np.fmod(next_error[:, 2] + np.pi, 2 * np.pi) - np.pi
         return next_error
 
     def get_top_pts(self, error):
-        """
-        Add noise to the error
-        Args:
-            error: error at time t, deterministic mean value
-        Returns:
-            error with noise
-        """
-        mean = error
+        N = error.shape[0]
 
-        p_value = multivariate_normal.pdf(self.all_pts, mean=mean, cov=self.noise)
-        p_value = p_value / np.sum(p_value)
-        top_idx = np.argsort(p_value)[-8:]
-        top_prob = p_value[top_idx]
-        top_info = np.concatenate((top_idx[:, None], top_prob[:, None]), axis=1)
-        return top_info
+        ex_indices = np.searchsorted(self.config.ex_space, error[:, 0], side='right') - 1
+        ey_indices = np.searchsorted(self.config.ey_space, error[:, 1], side='right') - 1
+        eth_indices = np.searchsorted(self.config.eth_space, error[:, 2], side='right') - 1
+
+        # Clipping indices to ensure they stay within the valid range
+        ex_indices = np.clip(ex_indices, 1, len(self.config.ex_space) - 2)
+        ey_indices = np.clip(ey_indices, 1, len(self.config.ey_space) - 2)
+        eth_indices = np.clip(eth_indices, 0, len(self.config.eth_space) - 1)  # Allow full range for angle initially
+
+        # Generate all possible combinations of [-1, 1] shifts for the indices
+        shift = np.array([-1, 1])
+        dx, dy, dth = np.meshgrid(shift, shift, shift, indexing='ij')
+        shifts = np.stack([dx.ravel(), dy.ravel(), dth.ravel()], axis=-1)
+
+        # Compute the new indices using broadcasting
+        all_ex_indices = ex_indices[:, None] + shifts[None, :, 0]
+        all_ey_indices = ey_indices[:, None] + shifts[None, :, 1]
+        all_eth_indices = eth_indices[:, None] + shifts[None, :, 2]
+
+        # Wrap around for angular dimension
+        all_eth_indices = np.mod(all_eth_indices, len(self.config.eth_space))
+
+        # Convert these indices to linear indices
+        flat_indices = (all_ex_indices * len(self.config.ey_space) * len(self.config.eth_space) +
+                        all_ey_indices * len(self.config.eth_space) +
+                        all_eth_indices).astype(int)
+
+        # Fetch the closest points
+        closest_pts = self.all_pts[flat_indices]
+
+        # Compute Mahalanobis distance and transform to log probabilities
+        diff = error[:, None, :] - closest_pts
+        log_prob = -0.5 * np.einsum('nij,jk,nik->ni', diff, self.cov_inv, diff)
+
+        # Subtract the max log probability to stabilize numerical computation
+        max_log_prob = np.max(log_prob, axis=1, keepdims=True)
+        log_prob -= max_log_prob
+
+        # Convert log probabilities to probabilities
+        pdf_values = np.exp(log_prob)
+        sum_pdf_values = pdf_values.sum(axis=-1, keepdims=True)
+        pdf_values /= sum_pdf_values
+
+        # Combine indices and probabilities into a final array
+        top = np.concatenate((flat_indices[..., np.newaxis], pdf_values[..., np.newaxis]), axis=2)
+        return top.astype(np.float32)
+
 
     def get_all_pts(self):
         ex, ey, eth = np.meshgrid(self.config.ex_space, self.config.ey_space, self.config.eth_space, indexing='ij')
         all_pts = np.column_stack((ex.ravel(), ey.ravel(), eth.ravel()))
         return all_pts
-
     def get_all_controls(self):
         v, w = np.meshgrid(self.config.v_space, self.config.w_space, indexing='ij')
         all_controls = np.column_stack((v.ravel(), w.ravel()))
@@ -256,11 +314,10 @@ if __name__ == "__main__":
                           Q, q, R, gamma, num_evals, collision_margin,
                           ValueFunction, output_dir, v_ex_space, v_ey_space, v_eth_space, v_alpha, v_beta_t, v_beta_e, v_lr, v_batch_size)
     gpi = GPI(GpiConfig)
-    points = gpi.get_all_pts()
-    top = gpi.get_top_pts(np.array([-2.,-1.6,0.08055366]))
     import time
     start = time.time()
-    transition_matrix = gpi.compute_transition_matrix()
+    gpi.compute_transition_matrix()
+    stage_cost = gpi.compute_stage_costs()
     print(time.time()-start)
     # transition_matrix = gpi.compute_transition_matrix()
 

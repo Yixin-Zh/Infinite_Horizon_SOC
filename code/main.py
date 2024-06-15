@@ -2,7 +2,7 @@ from time import time
 import numpy as np
 import utils
 from cec import CEC
-
+from gpi import GPI, config
 
 def main():
     # Obstacles in the environment
@@ -19,7 +19,8 @@ def main():
     # Initialize state
     cur_state = np.array([utils.x_init, utils.y_init, utils.theta_init])
     cur_iter = 0
-    controller = CEC()
+    # controller = CEC()
+    controller = GPI(config)
     # Main loop
     control_list = []
     while cur_iter * utils.time_step < utils.sim_time:
@@ -40,7 +41,7 @@ def main():
         ################################################################
 
         # Apply control input
-        next_state = utils.car_next_state(utils.time_step, cur_state, control, noise=True)
+        next_state = utils.car_next_state(utils.time_step, cur_state, control, noise=False)
         # Update current state
         cur_state = next_state
         # Loop time
@@ -68,7 +69,7 @@ def main():
     car_states = np.array(car_states)
     times = np.array(times)
     utils.visualize(car_states, ref_traj, obstacles, times, utils.time_step, save=True)
-    print(control_list)
+
 
 if __name__ == "__main__":
     main()
